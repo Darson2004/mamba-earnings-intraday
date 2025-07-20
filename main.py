@@ -45,10 +45,10 @@ def set_seed(seed,cuda):
 
 def dateinf(series, n_test):
     lt = len(series)
-    print('Training start',series[0])
-    print('Training end',series[lt-n_test-1])
-    print('Testing start',series[lt-n_test])
-    print('Testing end',series[lt-1])
+    print('Training start',series.iloc[0])
+    print('Training end',series.iloc[lt-n_test-1])
+    print('Testing start',series.iloc[lt-n_test])
+    print('Testing end',series.iloc[lt-1])
 
 set_seed(args.seed,args.cuda)
 
@@ -96,7 +96,8 @@ def PredictWithData(trainX, trainy, testX):
     return yhat
 
 data = pd.read_csv(args.ts_code+'.SH.csv')
-data['trade_date'] = pd.to_datetime(data['trade_date'], format='%Y%m%d')
+# Convert time column from HHMMSS format to datetime time objects
+data['trade_time'] = pd.to_datetime(data['trade_date'], format='%H%M%S').dt.time
 close = data.pop('close').values
 ratechg = data['pct_chg'].apply(lambda x:0.01*x).values
 data.drop(columns=['pre_close','change','pct_chg'],inplace=True)
@@ -104,7 +105,7 @@ dat = data.iloc[:,2:].values
 trainX, testX = dat[:-args.n_test, :], dat[-args.n_test:, :]
 trainy = ratechg[:-args.n_test]
 predictions = PredictWithData(trainX, trainy, testX)
-time = data['trade_date'][-args.n_test:]
+time = data['trade_time'][-args.n_test:]
 data1 = close[-args.n_test:]
 finalpredicted_stock_price = []
 pred = close[-args.n_test-1]
@@ -112,14 +113,17 @@ for i in range(args.n_test):
     pred = close[-args.n_test-1+i]*(1+predictions[i])
     finalpredicted_stock_price.append(pred)
 
-dateinf(data['trade_date'],args.n_test)
+dateinf(data['trade_time'],args.n_test)
 print('MSE RMSE MAE R2')
 evaluation_metric(data1, finalpredicted_stock_price)
 plt.figure(figsize=(10, 6))
-plt.plot(time, data1, label='Stock Price')
-plt.plot(time, finalpredicted_stock_price, label='Predicted Stock Price')
+# Convert time objects to strings for plotting
+time_str = [t.strftime('%H:%M:%S') for t in time]
+plt.plot(range(len(time_str)), data1, label='Stock Price')
+plt.plot(range(len(time_str)), finalpredicted_stock_price, label='Predicted Stock Price')
 plt.title('Stock Price Prediction')
 plt.xlabel('Time', fontsize=12, verticalalignment='top')
 plt.ylabel('Close', fontsize=14, horizontalalignment='center')
+plt.xticks(range(0, len(time_str), len(time_str)//10), [time_str[i] for i in range(0, len(time_str), len(time_str)//10)], rotation=45)
 plt.legend()
 plt.show()

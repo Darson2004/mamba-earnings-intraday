@@ -1,0 +1,16 @@
+*.jpg
+*.png
+*.pth
+*.csv
+*.h5
+*.xlsx
+__pycache__/
+*.log
+*.txt
+*.json
+*.yaml
+*.yml
+*.jsonl
+*.jsonl.gz
+*.jsonl.bz2
+.vs/
