@@ -1,5 +1,5 @@
 from mambastock_model import MambaStock
-from dataset import ClosePrice, TimeAlignedSampler, collate_fn
+from dataset_gpu import ClosePrice, TimeAlignedSampler, collate_fn
 import torch
 from torch.utils.data import DataLoader
 import torch.nn as nn
@@ -8,15 +8,46 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error
 import matplotlib.pyplot as plt
 import logging
 from datetime import datetime
+from torch.cuda.amp import autocast, GradScaler
+import torch.multiprocessing as mp
+from torch.nn.parallel import DataParallel
+import time
 
 # --- CONFIG ---
-h5_path = "h5_rty_data_test.h5"  # <-- HDF5 file path
+h5_path = "h5_rty_data.h5"  # <-- HDF5 file path
 seq_len = 30
-pred_len = 10
+pred_len = 330
 batch_size = 8
-epochs = 3
-lr = 1e-3
+epochs = 1
+lr = 1e-4  # Lower learning rate for fine-tuning from pretrained model
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("CUDA available:", torch.cuda.is_available())
+print("Device:", torch.cuda.get_device_name(0))
+
+# Add stability monitoring
+def check_model_health(model, step):
+    """Check for NaN/Inf in model weights"""
+    for name, param in model.named_parameters():
+        if torch.isnan(param).any() or torch.isinf(param).any():
+            print(f"⚠️  WARNING: {name} has NaN/Inf at step {step}")
+            return False
+    return True
+
+def check_gradients(model, step):
+    """Monitor gradient magnitudes"""
+    total_norm = 0
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            param_norm = param.grad.data.norm(2)
+            total_norm += param_norm.item() ** 2
+            if torch.isnan(param.grad).any():
+                print(f"⚠️  WARNING: NaN gradient in {name} at step {step}")
+                return False
+    total_norm = total_norm ** (1. / 2)
+    print(f"Gradient norm at step {step}: {total_norm:.4f}")  # Always print
+    if total_norm > 1.0:  # Lower threshold for warning
+        print(f"⚠️  WARNING: Large gradient norm {total_norm:.2f} at step {step}")
+    return True
 
 # Set up logging
 logging.basicConfig(
@@ -40,9 +71,6 @@ def force_log_write(message):
     for handler in logger.handlers:
         if isinstance(handler, logging.FileHandler):
             handler.flush()
-            # Force close and reopen to ensure write
-            handler.close()
-            handler._open()
 
 # Log start of training
 logger.info("="*60)
@@ -59,188 +87,99 @@ logger.info("="*60)
 
 
 # --- LOAD DATA ---
-dataset = ClosePrice(h5_path)
+# If you already have the dataset loaded in memory, you can comment out the next line to avoid reloading.
+# dataset = ClosePrice(h5_path)
 print(f"Dataset loaded: {len(dataset)} total items, {dataset.n_stocks} stocks")
 logger.info(f"Dataset loaded: {len(dataset)} total items, {dataset.n_stocks} stocks")
 logger.info("="*60)
 print(f"Starting all calculations after {seq_len} data points (time index {seq_len}) to exclude first {seq_len} points")
 
-# Create sampler and dataloader
-# Start at seq_len to truly exclude the first seq_len points from all calculations
-sampler = TimeAlignedSampler(dataset, batch_size=batch_size, start_time=seq_len, end_time=dataset.day_length-pred_len, shuffle=True)
-loader = DataLoader(dataset, batch_sampler=sampler, collate_fn=collate_fn)
+# --- BATCH SAMPLER ---
+batch_sampler = TimeAlignedSampler(dataset, batch_size=batch_size, start_time=seq_len, end_time=dataset.day_length - pred_len, shuffle=True)
 
-# --- INIT MODEL ---
-# Adjust input_size based on the ClosePrice dataset structure
+# --- MODEL INIT ---
 model = MambaStock(input_size=13, seq_len=seq_len, pred_len=pred_len).to(device)
-# Load original weights
 try:
-    # Load weights with strict=False to handle architecture changes
-    state_dict = torch.load("mambastock_original.pth", map_location=device)
-    # Try to load as much as possible, ignoring mismatches
-    model_dict = model.state_dict()
-    
-    # Filter state dict to only include keys that exist in current model
-    filtered_state_dict = {}
-    loaded_keys = 0
-    for key, value in state_dict.items():
-        if key in model_dict and model_dict[key].shape == value.shape:
-            filtered_state_dict[key] = value
-            loaded_keys += 1
-    
-    # Load the filtered state dict
-    model.load_state_dict(filtered_state_dict, strict=False)
-    logger.info(f"Loaded {loaded_keys} out of {len(state_dict)} keys from mambastock_original.pth")
-    print(f"Loaded {loaded_keys} out of {len(state_dict)} keys from mambastock_original.pth")
-    if loaded_keys == 0:
-        logger.warning("No compatible weights found, starting with random weights")
-        print("No compatible weights found, starting with random weights")
+    state_dict = torch.load("mambastock.pth", map_location=device)
+    model.load_state_dict(state_dict)
+    print("Loaded weights from mambastock.pth")
 except FileNotFoundError:
-    logger.warning("mambastock_original.pth not found, starting with random weights")
-    print("mambastock_original.pth not found, starting with random weights")
+    print("mambastock.pth not found, starting with random weights")
 except Exception as e:
-    logger.error(f"Error loading weights: {e}")
-    print(f"Error loading weights: {e}")
-optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-loss_fn = nn.MSELoss()
+    print(f"Error loading mambastock.pth: {e}")
+
+# --- LOSS FUNCTION ---
+loss_fn = nn.MSELoss().to(device)
+
+# --- OPTIMIZER ---
+optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
 
 # --- TRAIN LOOP ---
 model.train()
 for epoch in range(epochs):
     total_loss = 0
-    total_prediction_loss = 0  # Pure prediction loss (MSE on percentage changes)
-    total_smoothness_loss = 0  # Smoothness penalty
-    epoch_pct_mse = 0
-    epoch_pct_rmse = 0
-    epoch_directional_accuracy = 0
     batch_count = 0
-    total_predictions = 0  # Count total predictions for averaging
-    # Store predictions for last epoch
-    if epoch == epochs - 1:
-        all_stock_preds = [[] for _ in range(dataset.n_stocks)]
-        all_stock_trues = [[] for _ in range(dataset.n_stocks)]
-        all_stock_predlens = [[] for _ in range(dataset.n_stocks)]
-        all_stock_truelens = [[] for _ in range(dataset.n_stocks)]
-    for batch in loader:
-        close_prices = batch['close_prices']  # [batch_size, time_idx, 11]
-        time_index = batch['time_index']
-        batch_size_actual = close_prices.shape[0]
-        batch_loss = 0
-        batch_prediction_loss = 0
-        batch_smoothness_loss = 0
-        batch_pred_list = []
-        batch_true_list = []
-        for i in range(batch_size_actual):
-            stock_idx = i
-            stock_data = close_prices[i]  # [time_idx, 11]
-            if time_index + pred_len < dataset.day_length:
-                full_stock_data = dataset.data[stock_idx]
-                input_seq = full_stock_data[time_index-seq_len:time_index, :].clone().to(device)  # [seq_len, 11]
-                prediction_loss = 0  # Pure MSE loss on predictions
-                rolling_preds = []
-                rolling_trues = []
-                for t in range(pred_len):
-                    X = input_seq[-seq_len:].unsqueeze(0).to(device)
-                    pred = model(X)
-                    # Model now outputs [1, 1, 1] - extract the single prediction
-                    pred_1min = pred.squeeze()  # Remove all dimensions of size 1
-                    true_1min = full_stock_data[time_index + t, 10].to(device)
-                    prediction_loss += loss_fn(pred_1min, true_1min)
-                    rolling_preds.append(pred_1min)
-                    rolling_trues.append(true_1min)
-                    # Use the PREDICTED value for next prediction (realistic)
-                    # Create a placeholder with the predicted value in the pct_chg position (index 10)
-                    next_pred = full_stock_data[time_index + t, :].clone()
-                    # Convert tensor to scalar before assignment
-                    pred_val = pred_1min.detach().item()
-                    next_pred[10] = pred_val  # Replace actual with predicted
-                    next_pred = next_pred.unsqueeze(0).to(device)
-                    input_seq = torch.cat([input_seq, next_pred], dim=0)
-                # Calculate smoothness loss
-                smoothness_loss = 0
-                if len(rolling_preds) > 1:
-                    rolling_preds_tensor = torch.stack(rolling_preds)
-                    smoothness_loss = torch.mean((rolling_preds_tensor[1:] - rolling_preds_tensor[:-1])**2)
-                
-                # Combine losses
-                total_sample_loss = (prediction_loss / pred_len) + 0.25 * smoothness_loss
-                
-                # Track individual loss components
-                batch_prediction_loss += prediction_loss / pred_len
-                batch_smoothness_loss += smoothness_loss
-                batch_loss += total_sample_loss
-                total_predictions += pred_len
-                
-                batch_pred_list.extend([p.detach().cpu().item() for p in rolling_preds])
-                batch_true_list.extend([t.detach().cpu().item() for t in rolling_trues])
-                # Store for plotting (last epoch only)
-                if epoch == epochs - 1:
-                    all_stock_preds[stock_idx].extend([p.detach().cpu().item() for p in rolling_preds])
-                    all_stock_trues[stock_idx].extend([t.detach().cpu().item() for t in rolling_trues])
-                    all_stock_predlens[stock_idx].append([p.detach().cpu().item() for p in rolling_preds])
-                    all_stock_truelens[stock_idx].append([t.detach().cpu().item() for t in rolling_trues])
+    for batch_indices in batch_sampler:
+        # batch_indices: list of indices, each maps to (stock_idx, time_idx)
+        stock_indices = [idx // dataset.day_length for idx in batch_indices]
+        time_indices = [idx % dataset.day_length for idx in batch_indices]
+        # Extract all windows in parallel
+        # [batch_size, seq_len, features]
+        windows = []
+        targets = []
+        for s_idx, t_idx in zip(stock_indices, time_indices):
+            seq_start = max(0, t_idx - seq_len)
+            window = dataset.data[s_idx, seq_start:t_idx, :]
+            # Pad if needed
+            if window.shape[0] < seq_len:
+                pad_len = seq_len - window.shape[0]
+                pad_tensor = torch.zeros((pad_len, window.shape[1]), dtype=window.dtype, device=window.device)
+                window = torch.cat([pad_tensor, window], dim=0)
+            windows.append(window)
+            # Target: next pred_len minutes' pct_chg (feature 10)
+            target = dataset.data[s_idx, t_idx:t_idx+pred_len, 10]
+            targets.append(target)
+        windows = torch.stack(windows).to(device)  # [batch_size, seq_len, features]
+        targets = torch.stack(targets).to(device)  # [batch_size, pred_len]
+        # Batch rolling normalization
+        mean = windows.mean(dim=1, keepdim=True)  # [batch_size, 1, features]
+        std = windows.std(dim=1, keepdim=True)
+        std = torch.where(std > 1e-8, std, torch.ones_like(std))
+        windows_norm = (windows - mean) / std
+        # Model forward
+        preds = model(windows_norm)
+        # Ensure output shape is [batch_size, pred_len]
+        if preds.shape != targets.shape:
+            # If model outputs [batch_size, 1, 1], squeeze and repeat
+            if preds.shape[1:] == (1, 1):
+                preds = preds.squeeze(-1).squeeze(-1)  # [batch_size]
+                preds = preds.unsqueeze(1).repeat(1, pred_len)  # [batch_size, pred_len]
+                print("Warning: Model output was [batch_size, 1, 1], expanded to [batch_size, pred_len] for loss computation.")
             else:
-                continue
-        if batch_size_actual > 0:
-            batch_loss = batch_loss / batch_size_actual
-            batch_prediction_loss = batch_prediction_loss / batch_size_actual
-            batch_smoothness_loss = batch_smoothness_loss / batch_size_actual
-            optimizer.zero_grad()
-            batch_loss.backward()
-            optimizer.step()
-            total_loss += batch_loss.item()
-            total_prediction_loss += batch_prediction_loss.item()
-            total_smoothness_loss += batch_smoothness_loss.item()
-            batch_pred_arr = np.array(batch_pred_list)
-            batch_true_arr = np.array(batch_true_list)
-            if len(batch_pred_arr) > 0:
-                pct_mse = np.mean((batch_pred_arr - batch_true_arr) ** 2)
-                pct_rmse = np.sqrt(pct_mse)
-                pct_directional_accuracy = np.mean(np.sign(batch_pred_arr) == np.sign(batch_true_arr)) * 100
-                epoch_pct_mse += pct_mse
-                epoch_pct_rmse += pct_rmse
-                epoch_directional_accuracy += pct_directional_accuracy
-                batch_count += 1
+                raise ValueError(f"Model output shape {preds.shape} does not match target shape {targets.shape}")
+        # Compute loss
+        loss = loss_fn(preds, targets)
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+        optimizer.step()
+        total_loss += loss.item()
+        batch_count += 1
+        # Save model every 100 batches
+        if batch_count % 100 == 0:
+            torch.save(model.state_dict(), "mambastock.pth")
+            logger.info(f"Model saved to mambastock.pth after batch {batch_count} of epoch {epoch+1}")
     if batch_count > 0:
-        avg_pct_mse = epoch_pct_mse / batch_count
-        avg_pct_rmse = epoch_pct_rmse / batch_count
-        avg_directional_accuracy = epoch_directional_accuracy / batch_count
-        avg_prediction_loss = total_prediction_loss / batch_count
-        avg_smoothness_loss = total_smoothness_loss / batch_count
-        print(f"Epoch {epoch+1}/{epochs} - Loss: {total_loss:.4f}")
-        print(f"  Prediction Loss: {avg_prediction_loss:.6f}")
-        print(f"  Smoothness Loss: {avg_smoothness_loss:.6f}")
-        print(f"  Pct Change MSE: {avg_pct_mse:.6f}")
-        print(f"  Pct Change RMSE: {avg_pct_rmse:.6f}")
-        print(f"  Directional Accuracy: {avg_directional_accuracy:.2f}%")
-        force_log_write(f"{epoch+1} | {total_loss:.6f}")
+        avg_total_loss = total_loss / batch_count
+        print(f"Epoch {epoch+1}/{epochs} - Avg Loss per Batch: {avg_total_loss:.6f} (Total: {total_loss:.2f} across {batch_count:,} batches)")
+        force_log_write(f"{epoch+1} | Avg: {avg_total_loss:.6f} | Total: {total_loss:.2f} | Batches: {batch_count}")
     else:
-        print(f"Epoch {epoch+1}/{epochs} - Loss: {total_loss:.4f} (No valid batches)")
-        force_log_write(f"{epoch+1} | {total_loss:.6f} (No valid batches)")
-
-# --- PLOTTING: All stocks, full day, last epoch, subplots ---
-import matplotlib.pyplot as plt
-n_stocks = len(all_stock_preds)
-fig, axes = plt.subplots(n_stocks, 1, figsize=(14, 3*n_stocks), sharex=True)
-if n_stocks == 1:
-    axes = [axes]
-for stock_idx, (preds, trues) in enumerate(zip(all_stock_preds, all_stock_trues)):
-    x = np.arange(len(trues))
-    axes[stock_idx].plot(x, trues, label='Actual', linestyle='-', linewidth=1)
-    axes[stock_idx].plot(x, preds, label='Predicted', linestyle='--', linewidth=1)
-    axes[stock_idx].set_ylabel('Pct Change')
-    axes[stock_idx].set_title(f'Stock {stock_idx}')
-    axes[stock_idx].set_xlim(0, dataset.day_length)
-    if stock_idx == 0:
-        axes[stock_idx].legend()
-axes[-1].set_xlabel('Minute Index (0-389)')
-fig.suptitle('Predictions vs Actuals for Each Stock (Last Epoch, Full Day)', fontsize=16)
-plt.tight_layout(rect=(0, 0, 1, 0.97))
-plt.show()
+        print(f"Epoch {epoch+1}/{epochs} - No valid batches processed")
+        force_log_write(f"{epoch+1} | No valid batches")
 
 # --- SAVE MODEL ---
-torch.save(model.state_dict(), "mambastock_updated.pth")
-logger.info("Model saved to mambastock_updated.pth")
+torch.save(model.state_dict(), "mambastock.pth")
+logger.info("Model saved to mambastock.pth")
 logger.info("Training completed")
 
 # --- BASELINE ---
@@ -478,7 +417,7 @@ def evaluate_rolling_2min_prediction(dataset, model, seq_len, pred_len, device):
             X = input_seq.unsqueeze(0).to(device)
             
             # Monte Carlo dropout for uncertainty estimation
-            n_samples = 100
+            n_samples = 20
             pred_samples = []
             with torch.no_grad():
                 for _ in range(n_samples):
@@ -585,179 +524,58 @@ def evaluate_rolling_2min_prediction(dataset, model, seq_len, pred_len, device):
         'ci_upper': all_ci_upper
     }
 
-if __name__ == "__main__":
-    evaluate_rolling_2min_prediction(dataset, model, seq_len, pred_len, device)
-
-def compare_predictions():
-    """
-    Compare Mamba model vs a constant flat line baseline (e.g., zero).
-    """
-    print("Evaluating Mamba model vs flat line baseline...")
-
-    # Create a single test dataloader to ensure both models see the same data
-    test_sampler = TimeAlignedSampler(dataset, batch_size=batch_size, start_time=seq_len, end_time=dataset.day_length - pred_len, shuffle=False)
-    test_loader = DataLoader(dataset, batch_sampler=test_sampler, collate_fn=collate_fn)
-
-    all_mamba_predictions = []
-    all_actuals = []
-    all_times = []
-
+# --- GPU-OPTIMIZED ROLLING PREDICTION ---
+def rolling_multi_step_prediction(dataset, model, seq_len, pred_len, device, step=20):
     model.eval()
-    with torch.no_grad():
-        for batch in test_loader:
-            close_prices = batch['close_prices']  # shape: [batch_size, seq_len, features]
-            time_index = batch['time_index']
+    n_stocks = dataset.n_stocks
+    day_length = dataset.day_length
+    total_pred = pred_len
+    input_seqs = dataset.data[:, :seq_len, :].clone().to(device)  # [n_stocks, seq_len, features]
+    all_preds = []
+    all_trues = []
+    all_times = []
+    batch_losses = []
+    loss_fn = torch.nn.MSELoss()
+    for start in range(0, total_pred, step):
+        # Normalize each window (rolling, per stock, per batch)
+        mean = input_seqs.mean(dim=1, keepdim=True)
+        std = input_seqs.std(dim=1, keepdim=True)
+        std = torch.where(std > 1e-8, std, torch.ones_like(std))
+        input_norm = (input_seqs - mean) / std  # [n_stocks, window, features]
+        # Model prediction (on GPU)
+        preds = model(input_norm)  # [n_stocks, step]
+        if preds.shape[-1] != step:
+            preds = preds.squeeze(-1)
+        all_preds.append(preds.detach().cpu())
+        # Get the actual next step actuals for each stock
+        actuals = []
+        for stock_idx in range(n_stocks):
+            actual = dataset.data[stock_idx, seq_len+start:seq_len+start+step, 10]  # [step]
+            actuals.append(actual)
+        actuals = torch.stack(actuals).to(device)  # [n_stocks, step]
+        all_trues.append(actuals.cpu())
+        all_times.append(torch.arange(seq_len+start, seq_len+start+step))
+        # Calculate and log batch loss
+        batch_loss = loss_fn(preds, actuals).item()
+        batch_losses.append(batch_loss)
+        logger.info(f"Rolling batch {start//step+1}: MSE loss = {batch_loss:.6f}")
+        # For next round, append the actuals to the window, keep only the last (seq_len+step)
+        # For features, append all features, not just pct_chg
+        actuals_full = []
+        for stock_idx in range(n_stocks):
+            actual_full = dataset.data[stock_idx, seq_len+start:seq_len+start+step, :]
+            actuals_full.append(actual_full)
+        actuals_full = torch.stack(actuals_full).to(device)  # [n_stocks, step, features]
+        input_seqs = torch.cat([input_seqs, actuals_full], dim=1)[:, -seq_len-step:, :]  # [n_stocks, seq_len+step, features]
+    all_preds = torch.cat(all_preds, dim=1)  # [n_stocks, total_pred]
+    all_trues = torch.cat(all_trues, dim=1)  # [n_stocks, total_pred]
+    avg_loss = sum(batch_losses) / len(batch_losses) if batch_losses else float('nan')
+    print("Rolling multi-step prediction complete.")
+    print(f"Average rolling batch MSE loss: {avg_loss:.6f}")
+    return all_preds, all_trues
 
-            # Get actual values
-            if time_index + pred_len < dataset.day_length:
-                targets = []
-                for i in range(len(close_prices)):
-                    stock_idx = batch['stock_index'][i] if 'stock_index' in batch else i
-                    next_values = dataset.data[stock_idx, time_index + 1:time_index + 1 + pred_len, :]
-                    targets.append(torch.tensor(next_values, dtype=torch.float32))
-                y = torch.stack(targets)
-            else:
-                y = torch.zeros(len(close_prices), pred_len, 13)
-
-            # Generate Mamba predictions
-            X = close_prices[:, -seq_len:, :].to(device)
-            # Model now outputs only one prediction at a time
-            # We need to make rolling predictions for each sample
-            mamba_pred = []
-            for i in range(len(close_prices)):
-                input_seq = close_prices[i, -seq_len:, :].to(device)
-                sample_preds = []
-                for t in range(pred_len):
-                    X = input_seq.unsqueeze(0).to(device)
-                    pred = model(X).squeeze()
-                    sample_preds.append(pred)
-                    # For comparison, we don't have actual future values to append
-                    # So we'll use the last known value as a placeholder
-                    if t < pred_len - 1:  # Don't append for the last prediction
-                        last_known = input_seq[-1:, :]
-                        input_seq = torch.cat([input_seq, last_known], dim=0)
-                        input_seq = input_seq[-seq_len:, :]
-                mamba_pred.append(torch.stack(sample_preds))
-            mamba_pred = torch.stack(mamba_pred)  # [batch_size, pred_len]
-
-            # Only append to all_times when appending a prediction/target
-            mamba_pred_np = mamba_pred.cpu().numpy()
-            y_np = y.numpy()
-            for i in range(mamba_pred_np.shape[0]):
-                for t in range(mamba_pred_np.shape[1]):
-                    all_mamba_predictions.append(mamba_pred_np[i, t])  # Now just [batch, pred_len]
-                    all_actuals.append(y_np[i, t, 10])
-                    all_times.append(time_index + t)
-
-    all_mamba_predictions = np.array(all_mamba_predictions)
-    all_actuals = np.array(all_actuals)
-    times = np.array(all_times)
-
-    # Use a flat line (e.g., zero) as the baseline
-    flat_value = 0.0
-    flat_baseline = np.full_like(all_actuals, flat_value)
-    actuals = np.atleast_1d(all_actuals)
-    mamba_preds = np.atleast_1d(all_mamba_predictions)
-
-    # Calculate metrics for flat baseline
-    baseline_errors = flat_baseline - actuals
-    baseline_mse = np.mean(baseline_errors**2)
-    baseline_rmse = np.sqrt(baseline_mse)
-    valid_baseline = ~np.isnan(actuals) & ~np.isnan(flat_baseline)
-    baseline_corr = np.corrcoef(actuals[valid_baseline], flat_baseline[valid_baseline])[0, 1] if np.sum(valid_baseline) > 1 else float('nan')
-    baseline_directional = np.mean(np.sign(flat_baseline) == np.sign(actuals)) * 100
-
-    # Calculate metrics for Mamba
-    mamba_errors = mamba_preds - actuals
-    mamba_mse = np.mean(mamba_errors**2)
-    mamba_rmse = np.sqrt(mamba_mse)
-    valid_mamba = ~np.isnan(actuals) & ~np.isnan(mamba_preds)
-    mamba_corr = np.corrcoef(actuals[valid_mamba], mamba_preds[valid_mamba])[0, 1] if np.sum(valid_mamba) > 1 else float('nan')
-    mamba_directional = np.mean(np.sign(mamba_preds) == np.sign(actuals)) * 100
-
-    # Debug: Print array lengths to confirm alignment
-    print(f"all_times: {len(all_times)}, all_mamba_predictions: {len(all_mamba_predictions)}, all_actuals: {len(all_actuals)}")
-
-    print(f"\n{'='*60}")
-    print(f"{'METRIC':<20} {'FLAT BASELINE':<15} {'MAMBA':<15} {'IMPROVEMENT':<15}")
-    print(f"{'='*60}")
-    print(f"{'Mean Square Error':<20} {baseline_mse:<15.6f} {mamba_mse:<15.6f} {(baseline_mse - mamba_mse) / baseline_mse * 100 if baseline_mse != 0 else float('nan'):<15.2f}%")
-    print(f"{'Root Mean Square Error':<20} {baseline_rmse:<15.6f} {mamba_rmse:<15.6f} {(baseline_rmse - mamba_rmse) / baseline_rmse * 100 if baseline_rmse != 0 else float('nan'):<15.2f}%")
-    print(f"{'Correlation':<20} {baseline_corr:<15.4f} {mamba_corr:<15.4f} {(mamba_corr - baseline_corr) * 100 if not np.isnan(baseline_corr) and not np.isnan(mamba_corr) else float('nan'):<15.2f}%")
-    print(f"{'Directional Accuracy':<20} {baseline_directional:<15.2f}% {mamba_directional:<15.2f}% {(mamba_directional - baseline_directional):<15.2f}%")
-    print(f"{'='*60}")
-
-    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-    fig.suptitle('Mamba vs Flat Line Baseline Prediction Comparison (Excluding First seq_len Points)', fontsize=16, fontweight='bold')
-
-    min_length = min(len(actuals), len(flat_baseline), len(mamba_preds))
-    axes[0, 0].scatter(actuals[:min_length], flat_baseline[:min_length], alpha=0.6, s=20, label='Flat Baseline', color='blue')
-    axes[0, 0].scatter(actuals[:min_length], mamba_preds[:min_length], alpha=0.6, s=20, label='Mamba', color='red')
-    perfect = [min(actuals[:min_length].min(), mamba_preds[:min_length].min()),
-               max(actuals[:min_length].max(), mamba_preds[:min_length].max())]
-    axes[0, 0].plot(perfect, perfect, 'k--', lw=2, label='Perfect Prediction')
-    axes[0, 0].set_xlabel('Actual Percentage Change')
-    axes[0, 0].set_ylabel('Predicted Percentage Change')
-    axes[0, 0].set_title('Predicted vs Actual Values')
-    axes[0, 0].legend()
-    axes[0, 0].grid(True, alpha=0.3)
-
-    # --- FIX: Only plot histograms if there are valid (finite) values ---
-    valid_baseline_errors = baseline_errors[np.isfinite(baseline_errors)]
-    valid_mamba_errors = mamba_errors[np.isfinite(mamba_errors)]
-    if valid_baseline_errors.size > 0 and valid_mamba_errors.size > 0:
-        axes[0, 1].hist(valid_baseline_errors.flatten(), bins=30, alpha=0.7, label='Flat Baseline', color='blue', density=True)
-        axes[0, 1].hist(valid_mamba_errors.flatten(), bins=30, alpha=0.7, label='Mamba', color='red', density=True)
-        axes[0, 1].axvline(0, color='black', linestyle='--', alpha=0.8)
-        axes[0, 1].set_xlabel('Prediction Error')
-        axes[0, 1].set_ylabel('Density')
-        axes[0, 1].set_title('Error Distribution Comparison')
-        axes[0, 1].legend()
-        axes[0, 1].grid(True, alpha=0.3)
-    else:
-        axes[0, 1].text(0.5, 0.5, 'No valid error data to plot', ha='center', va='center')
-
-    min_length = min(50, len(flat_baseline), len(actuals), len(mamba_preds))
-    axes[1, 0].plot(range(min_length), actuals[:min_length], 'b-', label='Actual', alpha=0.7, linewidth=1)
-    axes[1, 0].plot(range(min_length), flat_baseline[:min_length], 'b--', label='Flat Baseline', alpha=0.7, linewidth=1)
-    axes[1, 0].plot(range(min_length), mamba_preds[:min_length], 'r--', label='Mamba', alpha=0.7, linewidth=1)
-    axes[1, 0].set_xlabel('Sample Index')
-    axes[1, 0].set_ylabel('Percentage Change')
-    axes[1, 0].set_title('Time Series: First 50 Predictions')
-    axes[1, 0].legend()
-    axes[1, 0].grid(True, alpha=0.3)
-
-    # Ensure all arrays are the same length for plotting
-    min_scatter_length = min(len(times), len(baseline_errors), len(mamba_errors))
-    times_plot = times[:min_scatter_length]
-    baseline_errors_plot = baseline_errors[:min_scatter_length]
-    mamba_errors_plot = mamba_errors[:min_scatter_length]
-
-    axes[1, 1].scatter(times_plot, baseline_errors_plot, alpha=0.6, s=20, label='Flat Baseline', color='blue')
-    axes[1, 1].scatter(times_plot, mamba_errors_plot, alpha=0.6, s=20, label='Mamba', color='red')
-    axes[1, 1].axhline(0, color='black', linestyle='--', alpha=0.5)
-    axes[1, 1].set_xlabel('Time Index (minutes from 9:30)')
-    axes[1, 1].set_ylabel('Prediction Error')
-    axes[1, 1].set_title('Error vs Time')
-    axes[1, 1].legend()
-    axes[1, 1].grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig('mamba_vs_flatline_comparison.png', dpi=300, bbox_inches='tight')
-    plt.show()
-
-    print(f"\nComparison plot saved as 'mamba_vs_flatline_comparison.png'")
-
-    print("mamba_preds shape:", mamba_preds.shape)
-    print("actuals shape:", actuals.shape)
-    print("Number of finite mamba_preds:", np.isfinite(mamba_preds).sum())
-    print("Number of finite actuals:", np.isfinite(actuals).sum())
-    print("First 10 mamba_preds:", mamba_preds[:10])
-    print("First 10 actuals:", actuals[:10])
-
-
-# Run comparison
-compare_predictions()
-
-
-
+if __name__ == "__main__":
+    # Run rolling multi-step prediction with step=20, pred_len=330
+    preds, trues = rolling_multi_step_prediction(dataset, model, seq_len=30, pred_len=330, device=device, step=20)
+    print("Predictions shape:", preds.shape)
+    print("Ground truth shape:", trues.shape)

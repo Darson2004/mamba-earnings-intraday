@@ -114,6 +114,11 @@ def convert_csv_to_hdf5(input_file, output_file, overwrite=False):
             merged = pd.merge(complete_times_df, group, on='trade_time', how='left')
             # Forward fill then backward fill close
             merged['close'] = merged['close'].ffill().bfill()
+            # DEBUG: Warn if any negative close prices before writing to HDF5
+            if merged['close'].min() < 0:
+                print(f"WARNING: Negative close price for {ts_code}-{date} in merged DataFrame!")
+                print(merged[['trade_time', 'close']].head(10))
+                print(merged[['trade_time', 'close']].tail(10))
             # If after filling there are still NaNs, skip this group
             if bool(merged['close'].isna().any()):
                 print(f"Could not fill all close values for {ts_code}-{date}. Skipping...")
@@ -135,13 +140,21 @@ def convert_csv_to_hdf5(input_file, output_file, overwrite=False):
             merged['pct_chg'] = percentage_change
             # Fill missing values for all columns
             for col in ['open', 'high', 'low', 'close', 'volume', 'pe', 'turnover_rate', 'total_share', 'float_share']:
+                if col not in merged.columns:
+                    merged[col] = 0.0
                 merged[col] = merged[col].ffill().bfill()
             # Convert trade_time to minutes since 09:30
             def time_to_minutes(tstr):
                 h, m, s = map(int, tstr.split(':'))
                 return (h - 9) * 60 + (m - 30) + s / 60
             trade_time_min = merged['trade_time'].apply(time_to_minutes).to_numpy()
-            # Stack all features into a 2D array: [open, high, low, close, volume, pe, turnover_rate, total_share, float_share, trade_time_min, pct_chg]
+            # Add mask columns for turnover_rate and pe
+            turnover_nan_mask = merged['turnover_rate'].isna().astype(float).to_numpy()
+            pe_nan_mask = merged['pe'].isna().astype(float).to_numpy()
+            # Fill NaNs with 0 for stacking
+            merged['turnover_rate'] = merged['turnover_rate'].fillna(0.0)
+            merged['pe'] = merged['pe'].fillna(0.0)
+            # Stack all features into a 2D array: [open, high, low, close, volume, pe, turnover_rate, total_share, float_share, trade_time_min, pct_chg, turnover_rate_mask, pe_mask]
             features = np.stack([
                 merged['open'].astype(float).to_numpy(),
                 merged['high'].astype(float).to_numpy(),
@@ -153,7 +166,9 @@ def convert_csv_to_hdf5(input_file, output_file, overwrite=False):
                 merged['total_share'].astype(float).to_numpy(),
                 merged['float_share'].astype(float).to_numpy(),
                 trade_time_min,
-                merged['pct_chg'].to_numpy()
+                merged['pct_chg'].to_numpy(),
+                turnover_nan_mask,
+                pe_nan_mask
             ], axis=1)
             h5f.create_dataset(dataset_name, data=features)
 

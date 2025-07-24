@@ -10,9 +10,8 @@ def parse_log_file(log_file_path):
     try:
         with open(log_file_path, 'r') as file:
             for line in file:
-                # Look for lines that match the pattern "Epoch X/Y - Loss: Z" format
-                # Example: "Epoch 1/3 - Loss: 20.7053"
-                match = re.search(r'Epoch\s+(\d+)/\d+\s+-\s+Loss:\s+([\d.]+)', line)
+                # Match lines like: 2025-07-20 01:40:55,077 - INFO - 1 | 20.339437
+                match = re.search(r'- INFO - (\d+) \| ([\d.]+)', line)
                 if match:
                     epoch = int(match.group(1))
                     loss = float(match.group(2))
