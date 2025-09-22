@@ -2,7 +2,7 @@
 
 import torch
 import torch.nn as nn
-from mamba import Mamba, MambaConfig  # Using the same Mamba package as main.py
+from mamba import Mamba, MambaConfig  # Import from local mamba.py file
 
 class MambaStock(nn.Module):
     def __init__(self, input_size=7, seq_len=60, pred_len=1):
