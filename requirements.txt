@@ -1,0 +1,20 @@
+# Core (model, training, backtesting, analysis)
+torch>=2.0
+numpy>=1.24
+pandas>=2.0
+h5py>=3.8
+matplotlib>=3.7
+scikit-learn>=1.2
+seaborn>=0.12
+
+# Data tooling (data_tools/)
+pytz>=2023.3
+tqdm>=4.65
+openpyxl>=3.1
+databento>=0.30
+python-dotenv>=1.0
+
+# Optional: Bloomberg Terminal access (data_tools/bbg_intraday_bars.py, xbbg_example.py).
+# blpapi is installed from Bloomberg's own index:
+#   pip install --index-url=https://blpapi.bloomberg.com/repository/releases/python/simple/ blpapi
+# xbbg>=0.7

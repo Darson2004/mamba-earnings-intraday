@@ -1,16 +1,40 @@
-*.jpg
-*.png
-*.pth
-*.csv
-*.h5
-*.xlsx
+# Python
 __pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Secrets (Databento key is read from DATABENTO_API_KEY / .env)
+.env
+
+# Market data and derived datasets (licensed or large; never committed)
+data/*
+!data/README.md
+*.csv
+*.xlsx
+*.h5
+*.hdf5
+*.npz
+*.parquet
+*.dbn
+*.dbn.zst
+
+# Model weights and run outputs written to the working directory
+*.pth
+*.pt
 *.log
-*.txt
-*.json
-*.yaml
-*.yml
-*.jsonl
-*.jsonl.gz
-*.jsonl.bz2
+log*.txt
+*.png
+*.jpg
+!docs/**/*.png
+!docs/**/*.jpg
+
+# Editors / OS
 .vs/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
