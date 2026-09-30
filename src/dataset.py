@@ -336,7 +336,9 @@ if __name__ == '__main__':
     try:
         # Test ClosePrice dataset - load all data to GPU
         print("=== Loading all data to GPU ===")
-        dataset = ClosePrice('/home/ubuntu/Moldova/h5_rty_data_processed.h5', load_to_gpu=True)
+        import sys
+        h5_path = sys.argv[1] if len(sys.argv) > 1 else 'data/h5_rty_data_processed.h5'
+        dataset = ClosePrice(h5_path, load_to_gpu=True)
         print(f"Dataset loaded: {len(dataset)} total items")
         print(f"Number of stocks: {dataset.n_stocks}")
         print(f"Day length: {dataset.day_length}")
@@ -378,6 +380,6 @@ if __name__ == '__main__':
             print(f"  All different stocks: {len(set(stock_names)) == len(stock_names)}")
             
     except FileNotFoundError:
-        print("Test file '/home/ubuntu/Moldova/h5_rty_data_processed.h5' not found.")
+        print(f"Test file '{h5_path}' not found.")
     except Exception as e:
         print(f"Test failed with error: {e}")

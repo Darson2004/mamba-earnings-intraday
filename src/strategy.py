@@ -23,9 +23,9 @@ class Trade(NamedTuple):
 
 class TradingStrategy:
     """
-    Millennium-style, picky, unified strategy skeleton.
+    Selective, unified strategy skeleton (see docs/reviews/strategy-upgrade-15-additions.pdf).
 
-    Implements critiques #1, #3-#9, #11-#17 (except #2 and #10 by explicit user request):
+    Implements review items #1, #3-#9, #11-#17 (#2 and #10 intentionally not applied):
     1) Correct SELL semantics (operate in SHARES, not dollars) and full exits.
     3) Unified clock: PREDICT_START, TRADE_START, TRADE_END, LAST_ENTRY.
     4) top_k actually enforced on entries (never restrict exits).
@@ -44,7 +44,7 @@ class TradingStrategy:
 
     Notes
     -----
-    • We intentionally *do not* truncate the internal per-stock sequence (user wants growing window),
+    • We intentionally *do not* truncate the internal per-stock sequence (growing window by design),
       but inference always uses the last `seq_len` slice and re-normalizes per minute.
     • Dataset API assumed:
         - dataset.data[idx] -> Tensor [T, F]
@@ -234,7 +234,7 @@ class TradingStrategy:
 
         t = 0
         while t < min(self.day_len, self.TRADE_END):
-            # 1) append this minute's row (growing window; do NOT truncate by user request)
+            # 1) append this minute's row (growing window; intentionally not truncated)
             for i, idx in enumerate(self.stock_indices):
                 if done[i]:
                     continue

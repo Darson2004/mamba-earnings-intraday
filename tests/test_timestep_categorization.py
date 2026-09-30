@@ -3,6 +3,11 @@
 Test script to demonstrate the new timestep categorization function
 """
 
+import os as _os
+import sys as _sys
+# Project modules live in src/; make them importable when run from tests/.
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "src"))
+
 import torch
 import numpy as np
 from strategy import TradingStrategy

@@ -1,6 +1,4 @@
-import sys
 import os
-sys.path.append("/home/ubuntu/Moldova/")  # Adjust if you cloned elsewhere
 from mambastock_model import MambaStock
 from dataset import ClosePrice, TimeAlignedSampler, collate_fn
 import torch

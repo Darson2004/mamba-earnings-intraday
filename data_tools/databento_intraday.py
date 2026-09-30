@@ -9,7 +9,8 @@ load_dotenv()
 client = Historical()
 
 # Load Excel file
-excel_path = 'C:/Users/darso/MambaStock/Moldova-main/earnings_equity_first.xlsx'
+# Earnings calendar workbook (NAME column + one or more *DATE* columns); override via env var.
+excel_path = os.environ.get('EARNINGS_XLSX', 'earnings_equity_first.xlsx')
 df = pd.read_excel(excel_path)
 
 # Standardize columns
