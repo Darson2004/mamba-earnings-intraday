@@ -16,19 +16,19 @@ result of the project.
 
 ## Key results
 
-The repo keeps no backtest logs or P&L files. The numbers below come from the three review write-ups
-in [`docs/reviews/`](docs/reviews/), which I produced with ChatGPT Deep Research from my backtest logs and code.
+The findings below come from my backtest logs and my code review at the time. The logs themselves
+are not committed, so the few specific numbers quoted are the ones the backtest printed; everything
+else is either visible in the code or stated qualitatively.
 
 - **The first design gave impossible forecasts.** It predicted one minute at a time and chained 20
-  steps together. The backtest log shows 20-minute forecasts of +20% to +44% (AGNC: +44.25%). A
-  per-minute bias of about 1.5% compounds to about 35% over 20 steps.
-- **The uncertainty layer did nothing.** Every prediction came out with `p_netpos ≈ 1.000` and
-  entropy ≈ 0. Even the smallest forecast (+1.22%) was treated as certain. As a result, none of the
-  confidence-based entry and exit rules ever triggered, and the strategy reduced to "always go long
-  and hold 20 minutes".
-- **The edge was about the same size as the costs.** The entry threshold (+0.10% forecast) matched
-  the round-trip cost (5 bps half-spread per side). One run took 52 trades in a short window, and
-  the model almost never forecast a down move.
+  steps together, so small per-step errors compounded. The backtest printed 20-minute forecasts of
+  +20% and more (AGNC: +44.25%).
+- **The uncertainty layer did nothing.** Every prediction came out with `p_netpos` = 1.000 and
+  entropy = 0.000. As a result, none of the confidence-based entry and exit rules ever triggered,
+  and the strategy reduced to "always go long and hold 20 minutes".
+- **The edge was about the same size as the costs.** In the code, the entry threshold (+0.10%
+  forecast) equals the round-trip cost (5 bps half-spread per side). One run took 52 trades in a
+  short window, and the model almost never forecast a down move.
 - **Fixing one problem exposed the next.** In v2 the target became a single 20-minute log return,
   the output was bounded with `tanh`, and a volatility-scaled clamp was added. That removed the
   explosions. The next problem recorded in the code is the opposite one: forecasts shrinking
@@ -101,11 +101,11 @@ after `TRADE_END − 20`.
 
 ## Results
 
-| Version | Forecast design | What the backtest showed | Source |
-|---|---|---|---|
-| v1 | 1-minute steps chained over 20 steps; MC-dropout `mu20`/`sigma20`, `p_netpos`, entropy gates | 20-minute forecasts of +20–44%; `p_netpos` ≈ 1.000 and entropy ≈ 0 on every forecast; 52 trades in a short window; almost no down forecasts; most exits at the 20-minute limit | `docs/reviews/model-predictions-and-strategy-review.pdf`, `docs/reviews/trading-model-performance-review.pdf` |
-| Simple threshold rules (`src/bare_strategy.py`) | Buy if forecast ≥ +0.10%; exit on −0.50% or after 20 minutes | Entry threshold equal to round-trip cost, so trades at best broke even after costs | same |
-| v2 | Direct 20-minute log-return target, `tanh`-bounded; fresh forecast each minute; volatility clamp; cost hurdle; bid/ask fills | Explosive forecasts gone; next recorded issue is forecast shrinkage toward zero; no cost-positive configuration recorded | `docs/reviews/strategy-upgrade-15-additions.pdf`, `src/learning_dynamics_analyzer.py` |
+| Version | Forecast design | What the backtest showed |
+|---|---|---|
+| v1 | 1-minute steps chained over 20 steps; MC-dropout `mu20`/`sigma20`, `p_netpos`, entropy gates | 20-minute forecasts of +20% and more (up to +44.25%); `p_netpos` = 1.000 and entropy = 0.000 on every forecast; 52 trades in a short window; almost no down forecasts; most exits at the 20-minute limit |
+| Simple threshold rules (`src/bare_strategy.py`) | Buy if forecast ≥ +0.10%; exit on −0.50% or after 20 minutes | Entry threshold equal to round-trip cost, so trades at best broke even after costs |
+| v2 (`src/strategy.py`) | Direct 20-minute log-return target, `tanh`-bounded; fresh forecast each minute; volatility clamp; cost hurdle; bid/ask fills | Explosive forecasts gone; next issue recorded in the code (`src/learning_dynamics_analyzer.py`) is forecast shrinkage toward zero; no cost-positive configuration recorded |
 
 `docs/product.md` also records the model's feature-importance ranking, most to least important: open,
 low, float_share, close, pct_chg, high, volume, pe_nan_mask, pe, turnover_rate_mask, turnover_rate,
@@ -115,15 +115,15 @@ total_share.
 
 | Problem | How it showed up | Fix in the code |
 |---|---|---|
-| Errors compounding across chained steps | Forecasts of +44% over 20 minutes | Predict the 20-minute return directly; never feed forecasts back in (`strategy.py` item 17) |
+| Errors compounding across chained steps | Forecasts of +44% over 20 minutes | Predict the 20-minute return directly; never feed forecasts back in (`src/strategy.py`) |
 | Overconfident uncertainty | `p_netpos` stuck at 1, entropy at 0, so the confidence gates never fired | Removed from v2. Lesson: check that the gates actually vary before trusting them |
 | Edge not covering costs | 0.10% threshold equal to 0.10% round-trip cost | Explicit hurdle `h`; entries ranked by `mu20 − h` |
-| Exits sold dollars, not shares | Positions left partly open after stops | Sells work in shares and always close the full position (item 1) |
-| Unbounded outliers driving position size | Extreme `mu20` | `tanh` output plus volatility clamp using MAD (item 14) |
+| Exits sold dollars, not shares | Positions could be left partly open | Sells work in shares and always close the full position |
+| Unbounded outliers driving position size | Extreme `mu20` | `tanh` output plus volatility clamp using MAD |
 | Forecasts squashed toward zero | Shrinkage after bounding | Return scale `G` changed from 2σ to the 99.5th percentile; `learning_dynamics_analyzer.py` compares train and validation loss curves |
 | Future data in the normalizer | Minute-of-day volume medians computed from all minutes, including later ones | Medians now use only the first 80% of minutes (`create_advanced_normalizer(use_historical_only=True)`) |
-| Unrepeatable runs | Date order and RNG varied between runs | `seed_everything` in the backtester; deterministic cuDNN |
-| Spread accounting | Spread cost not separated per fill, so it could be double-counted | Buys at the ask, sells at the bid; `spread_paid` recorded per fill, so realized P&L plus spread paid equals mid-price P&L (item 5) |
+| Unrepeatable runs | Results depended on RNG and date ordering | `seed_everything` in the backtester; deterministic cuDNN |
+| Spread accounting | Spread cost not separated per fill, so it could be double-counted | Buys at the ask, sells at the bid; `spread_paid` recorded per fill, so realized P&L plus spread paid equals mid-price P&L |
 
 Remaining weak points:
 
@@ -160,13 +160,14 @@ tests/                         smoke-test scripts (see below)
 docs/
   product.md                   original project goal
   cpu_and_memory.md            CPU fallback and GPU memory settings
-  reviews/                     the three LLM-assisted review PDFs cited above
 data/README.md                 how to obtain and build the data (none is committed)
 ```
 
 ## Reproducing
 
 ```bash
+git clone https://github.com/Darson2004/mamba-earnings-intraday.git
+cd mamba-earnings-intraday
 pip install -r requirements.txt          # Python 3.9+; see docs/cpu_and_memory.md for CPU-only torch
 
 # 1. Build data (see data/README.md): Databento key in DATABENTO_API_KEY

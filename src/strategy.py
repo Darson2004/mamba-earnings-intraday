@@ -23,9 +23,9 @@ class Trade(NamedTuple):
 
 class TradingStrategy:
     """
-    Selective, unified strategy skeleton (see docs/reviews/strategy-upgrade-15-additions.pdf).
+    Selective, unified intraday strategy.
 
-    Implements review items #1, #3-#9, #11-#17 (#2 and #10 intentionally not applied):
+    Design rules (numbering kept from the development checklist):
     1) Correct SELL semantics (operate in SHARES, not dollars) and full exits.
     3) Unified clock: PREDICT_START, TRADE_START, TRADE_END, LAST_ENTRY.
     4) top_k actually enforced on entries (never restrict exits).

@@ -5,7 +5,7 @@ licensed and cannot be redistributed, and the HDF5 training files are derived fr
 the scripts read or write under `data/` (and any `*.csv`, `*.h5`, `*.xlsx`, `*.pth` in the working
 directory) is git-ignored.
 
-## 1. Intraday bars around earnings (the MFT pipeline)
+## 1. Intraday bars around earnings (the main pipeline)
 
 Inputs you need:
 
